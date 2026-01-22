@@ -1352,6 +1352,32 @@ pub mod tikv_client {
                 .insert(GrpcMethod::new("tikvpb.Tikv", "DelegateCoprocessor"));
             self.inner.unary(req, path, codec).await
         }
+        /// Command for executing remote root executors pushed down from TiDB.
+        pub async fn exec_remote_executor(
+            &mut self,
+            request: impl tonic::IntoRequest<super::super::tipb::RemoteExecutorRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::super::tipb::RemoteExecutorResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::new(
+                        tonic::Code::Unknown,
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/tikvpb.Tikv/ExecRemoteExecutor",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("tikvpb.Tikv", "ExecRemoteExecutor"));
+            self.inner.unary(req, path, codec).await
+        }
         /// Command for executing custom user requests in TiKV coprocessor_v2.
         pub async fn raw_coprocessor(
             &mut self,

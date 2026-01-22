@@ -103,6 +103,9 @@ pub mod schedulingpb {
 pub mod tikvpb {
     include!("tikvpb.rs");
 }
+pub mod tipb {
+    include!("tipb.rs");
+}
 pub mod tracepb {
     include!("tracepb.rs");
 }

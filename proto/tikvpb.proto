@@ -6,6 +6,7 @@ import "kvrpcpb.proto";
 import "mpp.proto";
 import "raft_serverpb.proto";
 import "disaggregated.proto";
+import "executor.proto";
 
 import "gogoproto/gogo.proto";
 import "rustproto.proto";
@@ -76,6 +77,9 @@ service Tikv {
 
     // Command send by remote coprocessor to TiKV for executing coprocessor request.
     rpc DelegateCoprocessor(coprocessor.DelegateRequest) returns (coprocessor.DelegateResponse) {}
+
+    // Command for executing remote root executors pushed down from TiDB.
+    rpc ExecRemoteExecutor(tipb.RemoteExecutorRequest) returns (tipb.RemoteExecutorResponse) {}
 
     // Command for executing custom user requests in TiKV coprocessor_v2.
     rpc RawCoprocessor(kvrpcpb.RawCoprocessorRequest) returns (kvrpcpb.RawCoprocessorResponse) {}
