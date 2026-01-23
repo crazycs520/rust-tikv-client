@@ -554,6 +554,12 @@ pub trait HasLocks {
     }
 }
 
+impl HasLocks for crate::proto::coprocessor::Response {
+    fn take_locks(&mut self) -> Vec<kvrpcpb::LockInfo> {
+        self.locked.take().into_iter().collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::any::Any;

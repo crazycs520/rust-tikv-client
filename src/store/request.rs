@@ -8,6 +8,7 @@ use prost::Message;
 use tonic::transport::Channel;
 use tonic::IntoRequest;
 
+use crate::proto::coprocessor;
 use crate::proto::kvrpcpb;
 use crate::proto::resource_manager;
 use crate::proto::tikvpb;
@@ -350,6 +351,128 @@ impl_request_batch!(
     "raw_coprocessor"
 );
 impl_request_unary!(RawChecksumRequest, raw_checksum, "raw_checksum");
+
+#[async_trait]
+impl Request for coprocessor::Request {
+    async fn dispatch(
+        &self,
+        client: &TikvClient<Channel>,
+        timeout: Duration,
+    ) -> Result<Box<dyn Any + Send>> {
+        let stale_read = self
+            .context
+            .as_ref()
+            .map(|ctx| ctx.stale_read)
+            .unwrap_or(false);
+        if stale_read {
+            // Access locality is not tracked in the Rust client yet; treat it as local-zone.
+            crate::stats::observe_stale_read_request(false, self.encoded_len());
+        }
+
+        let mut req = self.clone().into_request();
+        req.set_timeout(timeout);
+        let resp = client
+            .clone()
+            .coprocessor(req)
+            .await
+            .map_err(Error::GrpcAPI)?;
+        let inner = resp.into_inner();
+
+        if stale_read {
+            // Access locality is not tracked in the Rust client yet; treat it as local-zone.
+            crate::stats::observe_stale_read_response(false, inner.encoded_len());
+        }
+
+        Ok(Box::new(inner) as Box<dyn Any + Send>)
+    }
+
+    fn label(&self) -> &'static str {
+        "coprocessor"
+    }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn context_mut(&mut self) -> &mut kvrpcpb::Context {
+        self.context.get_or_insert_with(kvrpcpb::Context::default)
+    }
+
+    fn set_leader(&mut self, leader: &RegionWithLeader) -> Result<()> {
+        let ctx = self.context_mut();
+        let leader_peer = leader.leader.as_ref().ok_or(Error::LeaderNotFound {
+            region: leader.ver_id(),
+        })?;
+        ctx.region_id = leader.region.id;
+        ctx.region_epoch = leader.region.region_epoch.clone();
+        ctx.peer = Some(leader_peer.clone());
+        Ok(())
+    }
+
+    fn set_api_version(&mut self, api_version: kvrpcpb::ApiVersion) {
+        let ctx = self.context_mut();
+        ctx.api_version = api_version.into();
+    }
+
+    fn set_request_source(&mut self, source: &str) {
+        let ctx = self.context_mut();
+        ctx.request_source = source.to_owned();
+    }
+
+    fn set_resource_group_tag(&mut self, tag: &[u8]) {
+        let ctx = self.context_mut();
+        ctx.resource_group_tag = tag.to_vec();
+    }
+
+    fn set_resource_group_name(&mut self, name: &str) {
+        let ctx = self.context_mut();
+        let resource_ctl_ctx = ctx
+            .resource_control_context
+            .get_or_insert(kvrpcpb::ResourceControlContext::default());
+        resource_ctl_ctx.resource_group_name = name.to_owned();
+    }
+
+    fn set_priority(&mut self, priority: CommandPriority) {
+        let ctx = self.context_mut();
+        ctx.priority = priority.into();
+    }
+
+    fn set_disk_full_opt(&mut self, disk_full_opt: DiskFullOpt) {
+        let ctx = self.context_mut();
+        ctx.disk_full_opt = disk_full_opt.into();
+    }
+
+    fn set_txn_source(&mut self, txn_source: u64) {
+        let ctx = self.context_mut();
+        ctx.txn_source = txn_source;
+    }
+
+    fn set_resource_control_override_priority(&mut self, override_priority: u64) {
+        let ctx = self.context_mut();
+        let resource_ctl_ctx = ctx
+            .resource_control_context
+            .get_or_insert(kvrpcpb::ResourceControlContext::default());
+        resource_ctl_ctx.override_priority = override_priority;
+    }
+
+    fn set_resource_control_penalty(&mut self, penalty: &resource_manager::Consumption) {
+        let ctx = self.context_mut();
+        let resource_ctl_ctx = ctx
+            .resource_control_context
+            .get_or_insert(kvrpcpb::ResourceControlContext::default());
+        resource_ctl_ctx.penalty = Some(penalty.clone());
+    }
+
+    fn set_replica_read(&mut self, replica_read: bool) {
+        let ctx = self.context_mut();
+        ctx.replica_read = replica_read;
+    }
+
+    fn set_stale_read(&mut self, stale_read: bool) {
+        let ctx = self.context_mut();
+        ctx.stale_read = stale_read;
+    }
+}
 
 impl_request_batch!(GetRequest, Get, kv_get, "kv_get");
 impl_request_batch!(ScanRequest, Scan, kv_scan, "kv_scan");

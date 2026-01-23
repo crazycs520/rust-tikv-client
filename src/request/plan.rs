@@ -149,41 +149,66 @@ where
     ) -> Result<<Self as Plan>::Result> {
         let shards = current_plan.shards(&pd_client).collect::<Vec<_>>().await;
         debug!("single_plan_handler, shards: {}", shards.len());
-        let mut handles = Vec::with_capacity(shards.len());
-        for shard in shards {
+
+        // Preserve shard order for the returned results. This is important for callers that
+        // concatenate region results (e.g. range-based scans / keep-order semantics) and expect
+        // the output to follow the shard stream order, even when per-shard requests run
+        // concurrently.
+        let shard_count = shards.len();
+        let mut tasks = FuturesUnordered::new();
+        for (idx, shard) in shards.into_iter().enumerate() {
             let (shard, region) = shard?;
             let clone = current_plan.clone_then_apply_shard(shard);
-            let fut = Self::single_shard_handler(
-                pd_client.clone(),
-                clone,
-                region,
-                backoff.clone(),
-                permits.clone(),
-                preserve_region_results,
-                request_context.clone(),
-                read_routing.clone(),
-                attempt,
-            );
-            handles.push(fut);
+            let pd_client = pd_client.clone();
+            let backoff = backoff.clone();
+            let permits = permits.clone();
+            let request_context = request_context.clone();
+            let read_routing = read_routing.clone();
+            let fut = async move {
+                let res = Self::single_shard_handler(
+                    pd_client,
+                    clone,
+                    region,
+                    backoff,
+                    permits,
+                    preserve_region_results,
+                    request_context,
+                    read_routing,
+                    attempt,
+                )
+                .await;
+                (idx, res)
+            };
+            tasks.push(fut);
         }
 
-        let mut tasks: FuturesUnordered<_> = handles.into_iter().collect();
+        let mut slots: Vec<Option<Result<<Self as Plan>::Result>>> =
+            std::iter::repeat_with(|| None).take(shard_count).collect();
         if preserve_region_results {
-            let mut results = Vec::new();
-            while let Some(res) = tasks.next().await {
-                match res {
-                    Ok(v) => results.extend(v),
-                    Err(e) => results.push(Err(e)),
-                }
+            while let Some((idx, res)) = tasks.next().await {
+                slots[idx] = Some(res);
             }
-            Ok(results)
         } else {
-            let mut results = Vec::new();
-            while let Some(res) = tasks.next().await {
-                results.extend(res?);
+            while let Some((idx, res)) = tasks.next().await {
+                let ok = res?;
+                slots[idx] = Some(Ok(ok));
             }
-            Ok(results)
         }
+
+        let mut results = Vec::new();
+        for (idx, slot) in slots.into_iter().enumerate() {
+            let Some(res) = slot else {
+                return Err(crate::internal_err!(
+                    "RetryableMultiRegion missing shard result at index {}",
+                    idx
+                ));
+            };
+            match res {
+                Ok(v) => results.extend(v),
+                Err(e) => results.push(Err(e)),
+            }
+        }
+        Ok(results)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1810,6 +1835,59 @@ mod test {
         }
     }
 
+    #[derive(Clone, Default)]
+    struct DelayedRawGetPlan {
+        shard_id: Option<u8>,
+    }
+
+    #[async_trait]
+    impl Plan for DelayedRawGetPlan {
+        type Result = crate::proto::kvrpcpb::RawGetResponse;
+
+        async fn execute(&self) -> Result<Self::Result> {
+            let shard = self
+                .shard_id
+                .ok_or_else(|| crate::internal_err!("DelayedRawGetPlan missing shard_id"))?;
+
+            // Delays are chosen so shards complete out-of-order when executed concurrently.
+            let delay_ms = match shard {
+                0 => 60,
+                1 => 10,
+                2 => 30,
+                _ => 0,
+            };
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+
+            let mut resp = crate::proto::kvrpcpb::RawGetResponse::default();
+            resp.value = vec![shard];
+            Ok(resp)
+        }
+    }
+
+    impl Shardable for DelayedRawGetPlan {
+        type Shard = u8;
+
+        fn shards(
+            &self,
+            _: &Arc<impl crate::pd::PdClient>,
+        ) -> BoxStream<'static, crate::Result<(Self::Shard, RegionWithLeader)>> {
+            stream::iter(vec![
+                Ok((0, MockPdClient::region1())),
+                Ok((1, MockPdClient::region2())),
+                Ok((2, MockPdClient::region3())),
+            ])
+            .boxed()
+        }
+
+        fn apply_shard(&mut self, shard: Self::Shard) {
+            self.shard_id = Some(shard);
+        }
+
+        fn apply_store(&mut self, _: &crate::store::RegionStore) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[tokio::test]
     async fn test_err() {
         let plan = RetryableMultiRegion {
@@ -1829,6 +1907,27 @@ mod test {
             read_routing: ReadRouting::default(),
         };
         assert!(plan.execute().await.is_err())
+    }
+
+    #[tokio::test]
+    async fn test_retryable_multi_region_preserves_shard_order_for_successes() -> Result<()> {
+        let plan = RetryableMultiRegion {
+            inner: DelayedRawGetPlan::default(),
+            pd_client: Arc::new(MockPdClient::default()),
+            backoff: Backoff::no_backoff(),
+            concurrency: 3,
+            preserve_region_results: false,
+            request_context: RequestContext::default(),
+            read_routing: ReadRouting::default(),
+        };
+
+        let results = plan.execute().await?;
+        let got: Vec<u8> = results
+            .into_iter()
+            .map(|r| r.expect("unexpected shard error").value[0])
+            .collect();
+        assert_eq!(got, vec![0, 1, 2]);
+        Ok(())
     }
 
     #[tokio::test]

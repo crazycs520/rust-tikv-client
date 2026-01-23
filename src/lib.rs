@@ -113,6 +113,10 @@ mod compat;
 mod config;
 mod disk_full_opt;
 #[doc(hidden)]
+pub mod coprocessor {
+    pub use crate::proto::coprocessor::*;
+}
+#[doc(hidden)]
 pub mod kvrpcpb {
     pub use crate::proto::kvrpcpb::*;
 }
@@ -191,6 +195,8 @@ pub use crate::kv::KvPair;
 pub use crate::kv::Value;
 #[doc(inline)]
 pub use crate::kv::ValueEntry;
+#[doc(hidden)]
+pub use crate::pd::{PdClient, PdRpcClient};
 #[doc(inline)]
 pub use crate::raw::lowering as raw_lowering;
 #[doc(inline)]
@@ -199,6 +205,8 @@ pub use crate::raw::Client as RawClient;
 pub use crate::raw::ColumnFamily;
 #[doc(inline)]
 pub use crate::raw::RawChecksum;
+#[doc(hidden)]
+pub use crate::region::{RegionId, RegionVerId, RegionWithLeader, StoreId};
 #[doc(inline)]
 pub use crate::request::RetryOptions;
 #[doc(inline)]

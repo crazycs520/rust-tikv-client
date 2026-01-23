@@ -54,6 +54,10 @@ pub trait KvRequest: Request + Sized + Clone + Sync + Send + 'static {
     type Response: HasKeyErrors + HasLocks + Clone + Send + 'static;
 }
 
+impl KvRequest for crate::proto::coprocessor::Request {
+    type Response = crate::proto::coprocessor::Response;
+}
+
 /// For requests or plans which are handled at TiKV store (other than region) level.
 pub trait StoreRequest {
     /// Apply the request to specified TiKV store.
@@ -97,6 +101,7 @@ mod test {
     use std::iter;
     use std::sync::atomic::AtomicUsize;
     use std::sync::Arc;
+    use std::sync::Mutex;
     use std::time::Duration;
 
     use tonic::transport::Channel;
@@ -104,6 +109,8 @@ mod test {
     use super::*;
     use crate::mock::MockKvClient;
     use crate::mock::MockPdClient;
+    use crate::proto::coprocessor;
+    use crate::proto::errorpb;
     use crate::proto::kvrpcpb;
     use crate::proto::pdpb::Timestamp;
     use crate::proto::tikvpb::tikv_client::TikvClient;
@@ -255,5 +262,179 @@ mod test {
             .extract_error()
             .plan();
         assert!(plan.execute().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_coprocessor_request_is_sharded_by_region() -> Result<()> {
+        let seen_region_ids: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_for_hook = seen_region_ids.clone();
+
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let Some(req) = req.downcast_ref::<coprocessor::Request>() else {
+                    return Err(crate::internal_err!("unexpected request type"));
+                };
+                let region_id = req
+                    .context
+                    .as_ref()
+                    .map(|ctx| ctx.region_id)
+                    .unwrap_or_default();
+                seen_for_hook.lock().unwrap().push(region_id);
+                Ok(Box::new(coprocessor::Response {
+                    data: vec![region_id as u8],
+                    ..Default::default()
+                }) as Box<dyn Any + Send>)
+            },
+        )));
+
+        let request = coprocessor::Request {
+            tp: 103, // DAG; the value is irrelevant for sharding tests.
+            data: vec![1, 2, 3],
+            ranges: vec![
+                coprocessor::KeyRange {
+                    start: vec![],
+                    end: vec![5],
+                },
+                coprocessor::KeyRange {
+                    start: vec![10],
+                    end: vec![20],
+                },
+                coprocessor::KeyRange {
+                    start: vec![250, 250],
+                    end: vec![],
+                },
+            ],
+            ..Default::default()
+        };
+
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            .resolve_lock(Backoff::no_backoff(), Keyspace::Disable)
+            .retry_multi_region_with_concurrency(Backoff::no_backoff(), 1)
+            .merge(CollectError)
+            .extract_error()
+            .plan();
+
+        let responses = plan.execute().await?;
+        let got: Vec<u8> = responses
+            .into_iter()
+            .map(|resp| resp.data.get(0).copied().unwrap_or_default())
+            .collect();
+        assert_eq!(got, vec![1, 2, 3]);
+        assert_eq!(*seen_region_ids.lock().unwrap(), vec![1, 2, 3]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coprocessor_request_resolve_lock_retries_on_locked_response() -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = calls.clone();
+
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let Some(_req) = req.downcast_ref::<coprocessor::Request>() else {
+                    return Err(crate::internal_err!("unexpected request type"));
+                };
+
+                let call = calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    let lock = kvrpcpb::LockInfo {
+                        key: vec![1],
+                        primary_lock: vec![1],
+                        lock_version: 0,
+                        lock_ttl: 1000,
+                        ..Default::default()
+                    };
+                    return Ok(Box::new(coprocessor::Response {
+                        locked: Some(lock),
+                        ..Default::default()
+                    }) as Box<dyn Any + Send>);
+                }
+
+                Ok(Box::new(coprocessor::Response {
+                    data: vec![42],
+                    ..Default::default()
+                }) as Box<dyn Any + Send>)
+            },
+        )));
+
+        let request = coprocessor::Request {
+            tp: 103,
+            data: vec![1],
+            ranges: vec![coprocessor::KeyRange {
+                start: vec![],
+                end: vec![5],
+            }],
+            ..Default::default()
+        };
+
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            // Keep the backoff delay at 0ms to avoid slowing down tests.
+            .resolve_lock(Backoff::no_jitter_backoff(0, 0, 1), Keyspace::Disable)
+            .retry_multi_region_with_concurrency(Backoff::no_backoff(), 1)
+            .merge(CollectError)
+            .extract_error()
+            .plan();
+
+        let responses = plan.execute().await?;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].data, vec![42]);
+        assert!(responses[0].locked.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_coprocessor_request_retries_on_region_error_response() -> Result<()> {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_hook = calls.clone();
+
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let Some(_req) = req.downcast_ref::<coprocessor::Request>() else {
+                    return Err(crate::internal_err!("unexpected request type"));
+                };
+
+                let call = calls_for_hook.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if call == 0 {
+                    let region_error = errorpb::Error {
+                        region_not_found: Some(errorpb::RegionNotFound { region_id: 1 }),
+                        ..Default::default()
+                    };
+                    return Ok(Box::new(coprocessor::Response {
+                        region_error: Some(region_error),
+                        ..Default::default()
+                    }) as Box<dyn Any + Send>);
+                }
+
+                Ok(Box::new(coprocessor::Response {
+                    data: vec![7],
+                    ..Default::default()
+                }) as Box<dyn Any + Send>)
+            },
+        )));
+
+        let request = coprocessor::Request {
+            tp: 103,
+            data: vec![1],
+            ranges: vec![coprocessor::KeyRange {
+                start: vec![],
+                end: vec![5],
+            }],
+            ..Default::default()
+        };
+
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            .resolve_lock(Backoff::no_backoff(), Keyspace::Disable)
+            .retry_multi_region_with_concurrency(Backoff::no_backoff(), 1)
+            .merge(CollectError)
+            .extract_error()
+            .plan();
+
+        let responses = plan.execute().await?;
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].data, vec![7]);
+        assert!(responses[0].region_error.is_none());
+        Ok(())
     }
 }

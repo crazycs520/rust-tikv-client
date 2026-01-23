@@ -75,6 +75,7 @@ has_region_error!(kvrpcpb::RawCasResponse);
 has_region_error!(kvrpcpb::RawCoprocessorResponse);
 has_region_error!(kvrpcpb::RawChecksumResponse);
 has_region_error!(kvrpcpb::FlushResponse);
+has_region_error!(crate::proto::coprocessor::Response);
 
 macro_rules! set_region_error {
     ($type:ty) => {
@@ -118,6 +119,7 @@ set_region_error!(kvrpcpb::RawCasResponse);
 set_region_error!(kvrpcpb::RawCoprocessorResponse);
 set_region_error!(kvrpcpb::RawChecksumResponse);
 set_region_error!(kvrpcpb::FlushResponse);
+set_region_error!(crate::proto::coprocessor::Response);
 
 macro_rules! has_key_error {
     ($type:ty) => {
@@ -169,6 +171,18 @@ has_str_error!(kvrpcpb::RawChecksumResponse);
 has_str_error!(kvrpcpb::ImportResponse);
 has_str_error!(kvrpcpb::DeleteRangeResponse);
 has_str_error!(kvrpcpb::UnsafeDestroyRangeResponse);
+
+impl HasKeyErrors for crate::proto::coprocessor::Response {
+    fn key_errors(&mut self) -> Option<Vec<Error>> {
+        if self.other_error.is_empty() {
+            None
+        } else {
+            Some(vec![Error::KvError {
+                message: std::mem::take(&mut self.other_error),
+            }])
+        }
+    }
+}
 
 impl HasKeyErrors for kvrpcpb::ScanResponse {
     fn key_errors(&mut self) -> Option<Vec<Error>> {

@@ -163,13 +163,8 @@ impl Key {
     /// This matches client-go's `kv.PrefixNextKey` semantics:
     /// - increment the key as a big-endian byte slice (carry propagation),
     /// - if the key is all `0xff`, return the empty key.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "client-go parity helper (PrefixNextKey); may be used by prefix scan helpers"
-        )
-    )]
+    // Older toolchains used by TiKV don't support `#[expect(..., reason = "...")]`.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn next_prefix_key(&self) -> Key {
         let mut buf = self.0.clone();
         for i in (0..buf.len()).rev() {

@@ -3,9 +3,11 @@
 use std::sync::Arc;
 
 use futures::stream::BoxStream;
+use futures::{StreamExt, TryStreamExt};
 
 use super::plan::PreserveShard;
 use crate::pd::PdClient;
+use crate::proto::{coprocessor, kvrpcpb};
 use crate::region::RegionWithLeader;
 use crate::request::plan::CleanupLocks;
 use crate::request::Dispatch;
@@ -59,6 +61,45 @@ pub trait Shardable {
     }
 
     fn apply_store(&mut self, store: &RegionStore) -> Result<()>;
+}
+
+impl Shardable for coprocessor::Request {
+    type Shard = Vec<coprocessor::KeyRange>;
+
+    fn shards(
+        &self,
+        pd_client: &Arc<impl PdClient>,
+    ) -> BoxStream<'static, Result<(Self::Shard, RegionWithLeader)>> {
+        let ranges: Vec<kvrpcpb::KeyRange> = self
+            .ranges
+            .iter()
+            .map(|r| kvrpcpb::KeyRange {
+                start_key: r.start.clone(),
+                end_key: r.end.clone(),
+            })
+            .collect();
+
+        crate::store::region_stream_for_ranges(ranges, pd_client.clone())
+            .map_ok(|(ranges, region)| {
+                let shard = ranges
+                    .into_iter()
+                    .map(|r| coprocessor::KeyRange {
+                        start: r.start_key,
+                        end: r.end_key,
+                    })
+                    .collect();
+                (shard, region)
+            })
+            .boxed()
+    }
+
+    fn apply_shard(&mut self, shard: Self::Shard) {
+        self.ranges = shard;
+    }
+
+    fn apply_store(&mut self, store: &RegionStore) -> Result<()> {
+        store.apply_to_request(self)
+    }
 }
 
 pub trait Batchable {
