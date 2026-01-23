@@ -384,6 +384,89 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_coprocessor_request_resolve_lock_cleans_up_expired_lock() -> Result<()> {
+        use std::sync::atomic::Ordering;
+
+        let cop_calls = Arc::new(AtomicUsize::new(0));
+        let cleanup_calls = Arc::new(AtomicUsize::new(0));
+        let resolve_lock_calls = Arc::new(AtomicUsize::new(0));
+
+        let cop_calls_for_hook = cop_calls.clone();
+        let cleanup_calls_for_hook = cleanup_calls.clone();
+        let resolve_lock_calls_for_hook = resolve_lock_calls.clone();
+
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                if let Some(_req) = req.downcast_ref::<coprocessor::Request>() {
+                    let call = cop_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                    if call == 0 {
+                        // lock_ttl=0 makes the lock immediately "expired" so resolve_locks will
+                        // actively cleanup + resolve it.
+                        let lock = kvrpcpb::LockInfo {
+                            key: vec![1],
+                            primary_lock: vec![1],
+                            lock_version: 0,
+                            lock_ttl: 0,
+                            ..Default::default()
+                        };
+                        return Ok(Box::new(coprocessor::Response {
+                            locked: Some(lock),
+                            ..Default::default()
+                        }) as Box<dyn Any + Send>);
+                    }
+                    return Ok(Box::new(coprocessor::Response {
+                        data: vec![99],
+                        ..Default::default()
+                    }) as Box<dyn Any + Send>);
+                }
+
+                if let Some(_req) = req.downcast_ref::<kvrpcpb::CleanupRequest>() {
+                    cleanup_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                    return Ok(Box::new(kvrpcpb::CleanupResponse {
+                        commit_version: 0,
+                        ..Default::default()
+                    }) as Box<dyn Any + Send>);
+                }
+
+                if let Some(_req) = req.downcast_ref::<kvrpcpb::ResolveLockRequest>() {
+                    resolve_lock_calls_for_hook.fetch_add(1, Ordering::SeqCst);
+                    return Ok(
+                        Box::new(kvrpcpb::ResolveLockResponse::default()) as Box<dyn Any + Send>
+                    );
+                }
+
+                Err(crate::internal_err!("unexpected request type"))
+            },
+        )));
+
+        let request = coprocessor::Request {
+            tp: 103,
+            data: vec![1],
+            ranges: vec![coprocessor::KeyRange {
+                start: vec![],
+                end: vec![5],
+            }],
+            ..Default::default()
+        };
+
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            .resolve_lock(Backoff::no_jitter_backoff(0, 0, 3), Keyspace::Disable)
+            .retry_multi_region_with_concurrency(Backoff::no_backoff(), 1)
+            .merge(CollectError)
+            .extract_error()
+            .plan();
+
+        let responses = plan.execute().await?;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(responses[0].data, vec![99]);
+
+        assert_eq!(cop_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cleanup_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(resolve_lock_calls.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn test_coprocessor_request_retries_on_region_error_response() -> Result<()> {
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_for_hook = calls.clone();
