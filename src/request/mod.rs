@@ -384,6 +384,55 @@ mod test {
     }
 
     #[tokio::test]
+    async fn test_resolve_lock_respects_lock_wait_timeout() {
+        let pd_client = Arc::new(MockPdClient::new(MockKvClient::with_dispatch_hook(
+            move |req: &dyn Any| {
+                let Some(_req) = req.downcast_ref::<coprocessor::Request>() else {
+                    return Err(crate::internal_err!("unexpected request type"));
+                };
+                let lock = kvrpcpb::LockInfo {
+                    key: vec![1],
+                    primary_lock: vec![1],
+                    lock_version: 0,
+                    lock_ttl: i64::MAX as u64,
+                    ..Default::default()
+                };
+                Ok(Box::new(coprocessor::Response {
+                    locked: Some(lock),
+                    ..Default::default()
+                }) as Box<dyn Any + Send>)
+            },
+        )));
+
+        let request = coprocessor::Request {
+            tp: 103,
+            data: vec![1],
+            ranges: vec![coprocessor::KeyRange {
+                start: vec![],
+                end: vec![5],
+            }],
+            ..Default::default()
+        };
+
+        let plan = crate::request::PlanBuilder::new(pd_client, Keyspace::Disable, request)
+            .resolve_lock_with_timeout(
+                Backoff::no_jitter_backoff(50, 50, 1),
+                Keyspace::Disable,
+                Some(std::time::Duration::from_millis(10)),
+            )
+            .retry_multi_region_with_concurrency(Backoff::no_backoff(), 1)
+            .merge(CollectError)
+            .extract_error()
+            .plan();
+
+        match plan.execute().await {
+            Ok(resp) => panic!("expected lock wait timeout, got response: {resp:?}"),
+            Err(crate::Error::LockWaitTimeout(_)) => {}
+            Err(other) => panic!("expected lock wait timeout, got error: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn test_coprocessor_request_resolve_lock_cleans_up_expired_lock() -> Result<()> {
         use std::sync::atomic::Ordering;
 

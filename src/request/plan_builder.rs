@@ -2,6 +2,7 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
+use std::time::Duration;
 
 use super::plan::PreserveShard;
 use super::Keyspace;
@@ -268,12 +269,25 @@ impl<PdC: PdClient, P: Plan, Ph: PlanBuilderPhase> PlanBuilder<PdC, P, Ph> {
     where
         P::Result: HasLocks + Default + SetRegionError,
     {
+        self.resolve_lock_with_timeout(backoff, keyspace, None)
+    }
+
+    pub fn resolve_lock_with_timeout(
+        self,
+        backoff: Backoff,
+        keyspace: Keyspace,
+        lock_wait_timeout: Option<Duration>,
+    ) -> PlanBuilder<PdC, ResolveLock<P, PdC>, Ph>
+    where
+        P::Result: HasLocks + Default + SetRegionError,
+    {
         PlanBuilder {
             pd_client: self.pd_client.clone(),
             plan: ResolveLock {
                 inner: self.plan,
-                backoff,
                 pd_client: self.pd_client,
+                backoff,
+                lock_wait_timeout,
                 keyspace,
                 request_context: self.request_context.clone(),
                 read_routing: self.read_routing.clone(),

@@ -282,6 +282,9 @@ pub enum Error {
     /// Failed to resolve a lock
     #[error("Failed to resolve lock")]
     ResolveLockError(Vec<kvrpcpb::LockInfo>),
+    /// Lock wait timeout exceeded.
+    #[error("Lock wait timeout exceeded; try restarting transaction")]
+    LockWaitTimeout(Vec<kvrpcpb::LockInfo>),
     /// Will raise this error when using a pessimistic txn only operation on an optimistic txn
     #[error("Invalid operation for this type of transaction")]
     InvalidTransactionType,

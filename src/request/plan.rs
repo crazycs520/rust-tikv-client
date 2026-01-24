@@ -2,7 +2,7 @@
 
 use std::marker::PhantomData;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_recursion::async_recursion;
 use async_trait::async_trait;
@@ -940,6 +940,7 @@ pub struct ResolveLock<P: Plan, PdC: PdClient> {
     pub inner: P,
     pub pd_client: Arc<PdC>,
     pub backoff: Backoff,
+    pub lock_wait_timeout: Option<Duration>,
     pub keyspace: Keyspace,
     pub(crate) request_context: RequestContext,
     pub(crate) read_routing: ReadRouting,
@@ -951,6 +952,7 @@ impl<P: Plan, PdC: PdClient> Clone for ResolveLock<P, PdC> {
             inner: self.inner.clone(),
             pd_client: self.pd_client.clone(),
             backoff: self.backoff.clone(),
+            lock_wait_timeout: self.lock_wait_timeout,
             keyspace: self.keyspace,
             request_context: self.request_context.clone(),
             read_routing: self.read_routing.clone(),
@@ -966,6 +968,10 @@ where
     type Result = P::Result;
 
     async fn execute(&self) -> Result<Self::Result> {
+        let backoff_template = self.backoff.clone();
+        let allow_reset_backoff = self.lock_wait_timeout.is_some();
+
+        let mut lock_wait_deadline: Option<Instant> = None;
         let mut result = self.inner.execute().await?;
         let mut clone = self.clone();
         loop {
@@ -976,6 +982,17 @@ where
 
             if self.backoff.is_none() {
                 return Err(Error::ResolveLockError(locks));
+            }
+
+            if lock_wait_deadline.is_none() {
+                lock_wait_deadline = self
+                    .lock_wait_timeout
+                    .and_then(|timeout| Instant::now().checked_add(timeout));
+            }
+            if let Some(deadline) = lock_wait_deadline {
+                if Instant::now() >= deadline {
+                    return Err(Error::LockWaitTimeout(locks));
+                }
             }
 
             let stale_read_meet_lock = self.read_routing.is_stale_read();
@@ -994,35 +1011,60 @@ where
             )
             .await?;
 
+            if let Some(deadline) = lock_wait_deadline {
+                if Instant::now() >= deadline {
+                    return Err(Error::LockWaitTimeout(live_locks));
+                }
+            }
+
             if stale_read_meet_lock {
                 // Trigger a region-level retry so the request can be re-routed (to leader). We use
                 // `epoch_not_match` with empty `current_regions` to avoid region-backoff sleeps.
                 if live_locks.is_empty() {
                     return Ok(reroute_to_leader::<P::Result>());
                 }
-                return match clone.backoff.next_delay_duration() {
-                    None => Err(Error::ResolveLockError(live_locks)),
-                    Some(delay_duration) => {
-                        crate::stats::observe_backoff_sleep("lock", delay_duration);
-                        sleep(delay_duration).await;
-                        Ok(reroute_to_leader::<P::Result>())
+                let delay_duration = match clone.backoff.next_delay_duration() {
+                    Some(delay) => delay,
+                    None if allow_reset_backoff && !backoff_template.is_none() => {
+                        clone.backoff = backoff_template.clone();
+                        clone.backoff.next_delay_duration().unwrap_or_default()
                     }
+                    None => return Err(Error::ResolveLockError(live_locks)),
                 };
+                if let Some(deadline) = lock_wait_deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if delay_duration >= remaining {
+                        return Err(Error::LockWaitTimeout(live_locks));
+                    }
+                }
+                crate::stats::observe_backoff_sleep("lock", delay_duration);
+                sleep(delay_duration).await;
+                return Ok(reroute_to_leader::<P::Result>());
             }
 
             if live_locks.is_empty() {
+                lock_wait_deadline = None;
                 result = self.inner.execute().await?;
                 continue;
             }
 
-            match clone.backoff.next_delay_duration() {
+            let delay_duration = match clone.backoff.next_delay_duration() {
+                Some(delay) => delay,
+                None if allow_reset_backoff && !backoff_template.is_none() => {
+                    clone.backoff = backoff_template.clone();
+                    clone.backoff.next_delay_duration().unwrap_or_default()
+                }
                 None => return Err(Error::ResolveLockError(live_locks)),
-                Some(delay_duration) => {
-                    crate::stats::observe_backoff_sleep("lock", delay_duration);
-                    sleep(delay_duration).await;
-                    result = clone.inner.execute().await?;
+            };
+            if let Some(deadline) = lock_wait_deadline {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if delay_duration >= remaining {
+                    return Err(Error::LockWaitTimeout(live_locks));
                 }
             }
+            crate::stats::observe_backoff_sleep("lock", delay_duration);
+            sleep(delay_duration).await;
+            result = clone.inner.execute().await?;
         }
     }
 }
@@ -1893,8 +1935,9 @@ mod test {
         let plan = RetryableMultiRegion {
             inner: ResolveLock {
                 inner: ErrPlan,
-                backoff: Backoff::no_backoff(),
                 pd_client: Arc::new(MockPdClient::default()),
+                backoff: Backoff::no_backoff(),
+                lock_wait_timeout: None,
                 keyspace: Keyspace::Disable,
                 request_context: RequestContext::default(),
                 read_routing: ReadRouting::default(),
