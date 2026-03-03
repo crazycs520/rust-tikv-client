@@ -196,7 +196,11 @@ pub use crate::kv::Value;
 #[doc(inline)]
 pub use crate::kv::ValueEntry;
 #[doc(hidden)]
-pub use crate::pd::{PdClient, PdRpcClient};
+pub use crate::pd::{PdClient, PdRpcClient, RetryClientTrait};
+#[doc(hidden)]
+pub use crate::proto::metapb;
+#[doc(hidden)]
+pub use crate::region_cache::RegionCache;
 #[doc(inline)]
 pub use crate::raw::lowering as raw_lowering;
 #[doc(inline)]
