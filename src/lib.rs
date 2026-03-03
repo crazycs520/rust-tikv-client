@@ -206,6 +206,8 @@ pub use crate::store::{RegionStore, Store};
 #[doc(hidden)]
 pub use crate::store::KvRpcClient;
 #[doc(hidden)]
+pub use crate::store::{KvClient, KvConnect, Request, TikvConnect};
+#[doc(hidden)]
 pub use crate::proto::keyspacepb;
 #[doc(hidden)]
 pub use crate::proto::metapb;
