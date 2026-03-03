@@ -198,7 +198,11 @@ pub use crate::kv::ValueEntry;
 #[doc(hidden)]
 pub use crate::pd::{PdClient, PdRpcClient, RetryClientTrait};
 #[doc(hidden)]
+pub use crate::proto::keyspacepb;
+#[doc(hidden)]
 pub use crate::proto::metapb;
+#[doc(hidden)]
+pub use crate::proto::pdpb;
 #[doc(hidden)]
 pub use crate::region_cache::RegionCache;
 #[doc(inline)]
