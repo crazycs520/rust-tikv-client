@@ -117,6 +117,10 @@ pub mod coprocessor {
     pub use crate::proto::coprocessor::*;
 }
 #[doc(hidden)]
+pub mod errorpb {
+    pub use crate::proto::errorpb::*;
+}
+#[doc(hidden)]
 pub mod kvrpcpb {
     pub use crate::proto::kvrpcpb::*;
 }
