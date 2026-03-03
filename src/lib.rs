@@ -202,6 +202,10 @@ pub use crate::kv::ValueEntry;
 #[doc(hidden)]
 pub use crate::pd::{PdClient, PdRpcClient, RetryClientTrait};
 #[doc(hidden)]
+pub use crate::store::{RegionStore, Store};
+#[doc(hidden)]
+pub use crate::store::KvRpcClient;
+#[doc(hidden)]
 pub use crate::proto::keyspacepb;
 #[doc(hidden)]
 pub use crate::proto::metapb;

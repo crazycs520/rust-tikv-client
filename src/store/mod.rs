@@ -17,6 +17,7 @@ use futures::{StreamExt, TryStreamExt};
 
 pub use self::client::KvClient;
 pub use self::client::KvConnect;
+pub use self::client::KvRpcClient;
 pub use self::client::TikvConnect;
 pub use self::errors::HasKeyErrors;
 pub use self::errors::HasRegionError;
