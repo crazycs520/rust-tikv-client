@@ -3,7 +3,6 @@
 use std::ops::{Bound, Range};
 
 use serde_derive::{Deserialize, Serialize};
-#[cfg(test)]
 use thiserror::Error;
 
 use crate::transaction::Mutation;
