@@ -53,15 +53,25 @@ impl From<RegionWithLeader> for RegionLoadResult {
 /// approximate an "idle TTL" (hot regions stay cached).
 struct CachedRegion {
     region: RegionWithLeader,
+    buckets: Option<metapb::Buckets>,
     ttl_epoch_sec: AtomicI64,
 }
 
 impl CachedRegion {
-    fn new(region: RegionWithLeader, ttl_epoch_sec: i64) -> CachedRegion {
+    fn new(
+        region: RegionWithLeader,
+        buckets: Option<metapb::Buckets>,
+        ttl_epoch_sec: i64,
+    ) -> CachedRegion {
         CachedRegion {
             region,
+            buckets,
             ttl_epoch_sec: AtomicI64::new(ttl_epoch_sec),
         }
+    }
+
+    fn to_region_load(&self) -> RegionLoadResult {
+        RegionLoadResult::new(self.region.clone(), self.buckets.clone())
     }
 }
 
@@ -199,25 +209,69 @@ impl<Client> RegionCache<Client> {
 }
 
 impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
-    // Retrieve cache entry by key. If there's no entry, query PD and update cache.
-    pub async fn get_region_by_key(&self, key: &Key) -> Result<RegionWithLeader> {
+    fn cached_region_load_by_key(
+        &self,
+        cache: &RegionCacheMap,
+        key: &Key,
+        now_epoch_sec: i64,
+        require_buckets: bool,
+    ) -> Option<RegionLoadResult> {
+        let (_, candidate_ver_id) = cache.key_to_ver_id.range(..=key.clone()).next_back()?;
+        let cached = cache.ver_id_to_region.get(candidate_ver_id)?;
+        if require_buckets && cached.buckets.is_none() {
+            return None;
+        }
+        if !self
+            .ttl
+            .check_and_refresh(&cached.ttl_epoch_sec, now_epoch_sec)
+        {
+            return None;
+        }
+        cached.region.contains(key).then(|| cached.to_region_load())
+    }
+
+    fn cached_region_load_by_ver_id(
+        &self,
+        cache: &RegionCacheMap,
+        ver_id: &RegionVerId,
+        now_epoch_sec: i64,
+        require_buckets: bool,
+    ) -> Option<RegionLoadResult> {
+        let cached = cache.ver_id_to_region.get(ver_id)?;
+        if require_buckets && cached.buckets.is_none() {
+            return None;
+        }
+        self.ttl
+            .check_and_refresh(&cached.ttl_epoch_sec, now_epoch_sec)
+            .then(|| cached.to_region_load())
+    }
+
+    fn cached_region_load_by_id(
+        &self,
+        cache: &RegionCacheMap,
+        id: RegionId,
+        now_epoch_sec: i64,
+        require_buckets: bool,
+    ) -> Option<RegionLoadResult> {
+        let ver_id = cache.id_to_ver_id.get(&id)?;
+        self.cached_region_load_by_ver_id(cache, ver_id, now_epoch_sec, require_buckets)
+    }
+
+    async fn get_region_load_by_key(
+        &self,
+        key: &Key,
+        require_buckets: bool,
+    ) -> Result<RegionLoadResult> {
         let key = key.clone();
         loop {
             // Fast path: cache hit.
             let now = now_epoch_sec();
             {
                 let region_cache_guard = self.region_cache.read().await;
-                if let Some((_, candidate_ver_id)) =
-                    region_cache_guard.key_to_ver_id.range(..=&key).next_back()
+                if let Some(cached) =
+                    self.cached_region_load_by_key(&region_cache_guard, &key, now, require_buckets)
                 {
-                    if let Some(cached) = region_cache_guard.ver_id_to_region.get(candidate_ver_id)
-                    {
-                        if self.ttl.check_and_refresh(&cached.ttl_epoch_sec, now)
-                            && cached.region.contains(&key)
-                        {
-                            return Ok(cached.region.clone());
-                        }
-                    }
+                    return Ok(cached);
                 }
             }
 
@@ -243,26 +297,26 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             let now = now_epoch_sec();
             {
                 let region_cache_guard = self.region_cache.read().await;
-                if let Some((_, candidate_ver_id)) =
-                    region_cache_guard.key_to_ver_id.range(..=&key).next_back()
+                if let Some(cached) =
+                    self.cached_region_load_by_key(&region_cache_guard, &key, now, require_buckets)
                 {
-                    if let Some(cached) = region_cache_guard.ver_id_to_region.get(candidate_ver_id)
-                    {
-                        if self.ttl.check_and_refresh(&cached.ttl_epoch_sec, now)
-                            && cached.region.contains(&key)
-                        {
-                            let mut in_flight = self.in_flight_region_by_key.lock().await;
-                            in_flight.remove(&key);
-                            drop(in_flight);
-                            notify.notify_waiters();
-                            return Ok(cached.region.clone());
-                        }
-                    }
+                    let mut in_flight = self.in_flight_region_by_key.lock().await;
+                    in_flight.remove(&key);
+                    drop(in_flight);
+                    notify.notify_waiters();
+                    return Ok(cached);
                 }
             }
 
             // Fetch from PD without holding any cache locks.
-            let fetched = self.read_through_region_by_key(key.clone()).await;
+            let fetched = if require_buckets {
+                self.read_through_region_by_key_with_buckets(key.clone())
+                    .await
+            } else {
+                self.read_through_region_by_key(key.clone())
+                    .await
+                    .map(RegionLoadResult::from)
+            };
 
             // Always clear the in-flight marker first, then wake waiters.
             let mut in_flight = self.in_flight_region_by_key.lock().await;
@@ -273,6 +327,23 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
         }
     }
 
+    // Retrieve cache entry by key. If there's no entry, query PD and update cache.
+    pub async fn get_region_by_key(&self, key: &Key) -> Result<RegionWithLeader> {
+        self.get_region_load_by_key(key, false)
+            .await
+            .map(RegionLoadResult::into_region)
+    }
+
+    /// Returns the region for `key` together with its cached bucket version.
+    pub async fn get_region_with_bucket_version_by_key(
+        &self,
+        key: &Key,
+    ) -> Result<(RegionWithLeader, u64)> {
+        let loaded = self.get_region_load_by_key(key, true).await?;
+        let bucket_version = loaded.buckets.as_ref().map_or(0, |buckets| buckets.version);
+        Ok((loaded.region, bucket_version))
+    }
+
     // Retrieve cache entry by RegionId. If there's no entry, query PD and update cache.
     pub async fn get_region_by_id(&self, id: RegionId) -> Result<RegionWithLeader> {
         loop {
@@ -280,12 +351,10 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             let now = now_epoch_sec();
             {
                 let region_cache_guard = self.region_cache.read().await;
-                if let Some(ver_id) = region_cache_guard.id_to_ver_id.get(&id) {
-                    if let Some(cached) = region_cache_guard.ver_id_to_region.get(ver_id) {
-                        if self.ttl.check_and_refresh(&cached.ttl_epoch_sec, now) {
-                            return Ok(cached.region.clone());
-                        }
-                    }
+                if let Some(cached) =
+                    self.cached_region_load_by_id(&region_cache_guard, id, now, false)
+                {
+                    return Ok(cached.into_region());
                 }
             }
 
@@ -311,16 +380,14 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             let now = now_epoch_sec();
             {
                 let region_cache_guard = self.region_cache.read().await;
-                if let Some(ver_id) = region_cache_guard.id_to_ver_id.get(&id) {
-                    if let Some(cached) = region_cache_guard.ver_id_to_region.get(ver_id) {
-                        if self.ttl.check_and_refresh(&cached.ttl_epoch_sec, now) {
-                            let mut in_flight = self.in_flight_region_by_id.lock().await;
-                            in_flight.remove(&id);
-                            drop(in_flight);
-                            notify.notify_waiters();
-                            return Ok(cached.region.clone());
-                        }
-                    }
+                if let Some(cached) =
+                    self.cached_region_load_by_id(&region_cache_guard, id, now, false)
+                {
+                    let mut in_flight = self.in_flight_region_by_id.lock().await;
+                    in_flight.remove(&id);
+                    drop(in_flight);
+                    notify.notify_waiters();
+                    return Ok(cached.into_region());
                 }
             }
 
@@ -363,7 +430,7 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             .clone()
             .get_region_with_buckets(key.into())
             .await?;
-        self.add_region(loaded.region.clone()).await;
+        self.add_region_load(loaded.clone()).await;
         Ok(loaded)
     }
 
@@ -376,8 +443,28 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             .clone()
             .get_region_by_id_with_buckets(id)
             .await?;
-        self.add_region(loaded.region.clone()).await;
+        self.add_region_load(loaded.clone()).await;
         Ok(loaded)
+    }
+
+    pub(crate) async fn get_cached_region_buckets_by_id(
+        &self,
+        id: RegionId,
+    ) -> Option<metapb::Buckets> {
+        let now = now_epoch_sec();
+        let region_cache_guard = self.region_cache.read().await;
+        self.cached_region_load_by_id(&region_cache_guard, id, now, true)
+            .and_then(|loaded| loaded.buckets)
+    }
+
+    pub(crate) async fn get_cached_region_buckets_by_ver_id(
+        &self,
+        ver_id: &RegionVerId,
+    ) -> Option<metapb::Buckets> {
+        let now = now_epoch_sec();
+        let region_cache_guard = self.region_cache.read().await;
+        self.cached_region_load_by_ver_id(&region_cache_guard, ver_id, now, true)
+            .and_then(|loaded| loaded.buckets)
     }
 
     async fn read_through_store_by_id(&self, id: StoreId) -> Result<Store> {
@@ -387,12 +474,28 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     }
 
     pub async fn add_region(&self, region: RegionWithLeader) {
+        self.add_region_load(RegionLoadResult::from(region)).await;
+    }
+
+    async fn add_region_load(&self, loaded: RegionLoadResult) {
         // Keep the critical section small: `RwLock` is global for region index invariants, so we
         // avoid any `.await` and do only local computations while holding it.
         let mut cache = self.region_cache.write().await;
 
         let now = now_epoch_sec();
         let ttl_epoch_sec = self.ttl.next_ttl(now);
+
+        let RegionLoadResult {
+            region,
+            buckets: mut loaded_buckets,
+        } = loaded;
+        let ver_id = region.ver_id();
+        if loaded_buckets.is_none() {
+            loaded_buckets = cache
+                .ver_id_to_region
+                .get(&ver_id)
+                .and_then(|cached| cached.buckets.clone());
+        }
 
         let end_key = region.end_key();
         let mut to_be_removed: HashSet<RegionVerId> = HashSet::new();
@@ -444,14 +547,14 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             cache.key_to_ver_id.remove(&start_key);
             cache.id_to_ver_id.remove(&region_to_remove.region.id());
         }
-        let ver_id = region.ver_id();
         cache
             .key_to_ver_id
             .insert(region.start_key(), ver_id.clone());
         cache.id_to_ver_id.insert(region.id(), ver_id.clone());
-        cache
-            .ver_id_to_region
-            .insert(ver_id, CachedRegion::new(region, ttl_epoch_sec));
+        cache.ver_id_to_region.insert(
+            ver_id,
+            CachedRegion::new(region, loaded_buckets, ttl_epoch_sec),
+        );
     }
 
     pub async fn update_leader(
@@ -541,6 +644,7 @@ mod test {
 
     use super::RegionCache;
     use crate::common::Error;
+    use crate::mock::region_buckets;
     use crate::pd::RetryClientTrait;
     use crate::proto::keyspacepb;
     use crate::proto::metapb::RegionEpoch;
@@ -548,6 +652,7 @@ mod test {
     use crate::region::RegionId;
     use crate::region::RegionWithLeader;
     use crate::region_cache::is_valid_tikv_store;
+    use crate::region_cache::RegionLoadResult;
     use crate::Key;
     use crate::Result;
 
@@ -555,6 +660,7 @@ mod test {
     struct MockRetryClient {
         pub regions: Mutex<HashMap<RegionId, RegionWithLeader>>,
         pub get_region_count: AtomicU64,
+        pub get_region_with_buckets_count: AtomicU64,
     }
 
     struct BlockingGetRegionByIdClient {
@@ -650,6 +756,25 @@ mod test {
                 .ok_or_else(|| Error::StringError("MockRetryClient: region not found".to_owned()))
         }
 
+        async fn get_region_with_buckets(
+            self: Arc<Self>,
+            key: Vec<u8>,
+        ) -> Result<RegionLoadResult> {
+            self.get_region_with_buckets_count.fetch_add(1, SeqCst);
+            self.regions
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, r)| r.contains(&key.clone().into()))
+                .map(|(_, r)| r.clone())
+                .next()
+                .map(|region| {
+                    let buckets = region_buckets(&region);
+                    RegionLoadResult::new(region, Some(buckets))
+                })
+                .ok_or_else(|| Error::StringError("MockRetryClient: region not found".to_owned()))
+        }
+
         async fn get_region_by_id(
             self: Arc<Self>,
             region_id: crate::region::RegionId,
@@ -662,6 +787,25 @@ mod test {
                 .filter(|(id, _)| id == &&region_id)
                 .map(|(_, r)| r.clone())
                 .next()
+                .ok_or_else(|| Error::StringError("MockRetryClient: region not found".to_owned()))
+        }
+
+        async fn get_region_by_id_with_buckets(
+            self: Arc<Self>,
+            region_id: crate::region::RegionId,
+        ) -> Result<RegionLoadResult> {
+            self.get_region_with_buckets_count.fetch_add(1, SeqCst);
+            self.regions
+                .lock()
+                .await
+                .iter()
+                .filter(|(id, _)| id == &&region_id)
+                .map(|(_, r)| r.clone())
+                .next()
+                .map(|region| {
+                    let buckets = region_buckets(&region);
+                    RegionLoadResult::new(region, Some(buckets))
+                })
                 .ok_or_else(|| Error::StringError("MockRetryClient: region not found".to_owned()))
         }
 
@@ -1292,6 +1436,114 @@ mod test {
         assert!(cache.get_region_by_key(&vec![20].into()).await.is_err());
         assert!(cache.get_region_by_key(&vec![25].into()).await.is_err());
         assert_eq!(cache.get_region_by_key(&vec![60].into()).await?, region4);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_get_region_with_bucket_version_by_key_uses_cache_and_reloads_after_invalidate(
+    ) -> Result<()> {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new_with_ttl(
+            retry_client.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        );
+
+        let region = region(1, vec![], vec![10]);
+        let buckets = region_buckets(&region);
+        let key: Key = vec![5].into();
+        retry_client
+            .regions
+            .lock()
+            .await
+            .insert(region.id(), region.clone());
+
+        let (resolved, bucket_version) = cache.get_region_with_bucket_version_by_key(&key).await?;
+        assert_eq!(resolved, region);
+        assert_eq!(bucket_version, buckets.version);
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 1);
+
+        let (_, cached_bucket_version) = cache.get_region_with_bucket_version_by_key(&key).await?;
+        assert_eq!(cached_bucket_version, buckets.version);
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 1);
+        assert_eq!(
+            cache.get_cached_region_buckets_by_id(1).await,
+            Some(buckets.clone())
+        );
+
+        cache.invalidate_region_cache(resolved.ver_id()).await;
+        assert_eq!(cache.get_cached_region_buckets_by_id(1).await, None);
+
+        let (_, reloaded_bucket_version) =
+            cache.get_region_with_bucket_version_by_key(&key).await?;
+        assert_eq!(reloaded_bucket_version, buckets.version);
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_read_through_region_by_id_with_buckets_populates_bucket_cache() -> Result<()> {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new_with_ttl(
+            retry_client.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        );
+
+        let region = region(1, vec![], vec![10]);
+        let buckets = region_buckets(&region);
+        retry_client
+            .regions
+            .lock()
+            .await
+            .insert(region.id(), region.clone());
+
+        let loaded = cache
+            .read_through_region_by_id_with_buckets(region.id())
+            .await?;
+        assert_eq!(loaded.region, region);
+        assert_eq!(loaded.buckets, Some(buckets.clone()));
+        assert_eq!(
+            cache.get_cached_region_buckets_by_id(region.id()).await,
+            Some(buckets.clone())
+        );
+        assert_eq!(
+            cache
+                .get_cached_region_buckets_by_ver_id(&region.ver_id())
+                .await,
+            Some(buckets)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_add_region_preserves_cached_buckets_for_same_ver_id() -> Result<()> {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new_with_ttl(
+            retry_client.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        );
+
+        let region = region(1, vec![], vec![10]);
+        let buckets = region_buckets(&region);
+        retry_client
+            .regions
+            .lock()
+            .await
+            .insert(region.id(), region.clone());
+
+        cache
+            .read_through_region_by_key_with_buckets(vec![5].into())
+            .await?;
+        cache.add_region(region.clone()).await;
+
+        assert_eq!(
+            cache
+                .get_cached_region_buckets_by_ver_id(&region.ver_id())
+                .await,
+            Some(buckets)
+        );
         Ok(())
     }
 
