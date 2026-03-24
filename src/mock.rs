@@ -182,6 +182,37 @@ impl MockPdClient {
 
         region
     }
+
+    pub(crate) fn lookup_region_by_key(bytes: &[u8]) -> RegionWithLeader {
+        if bytes.is_empty() || bytes < &[10][..] {
+            Self::region1()
+        } else if bytes >= &[10][..] && bytes < &[250, 250][..] {
+            Self::region2()
+        } else {
+            Self::region3()
+        }
+    }
+
+    pub(crate) fn lookup_region_by_id(id: RegionId) -> Result<RegionWithLeader> {
+        match id {
+            1 => Ok(Self::region1()),
+            2 => Ok(Self::region2()),
+            3 => Ok(Self::region3()),
+            _ => Err(Error::RegionNotFoundInResponse { region_id: id }),
+        }
+    }
+}
+
+pub(crate) fn region_buckets(region: &RegionWithLeader) -> metapb::Buckets {
+    metapb::Buckets {
+        region_id: region.id(),
+        version: region.id() * 10 + 1,
+        keys: vec![
+            region.region.start_key.clone(),
+            region.region.end_key.clone(),
+        ],
+        ..Default::default()
+    }
 }
 
 #[async_trait]
@@ -194,24 +225,11 @@ impl PdClient for MockPdClient {
 
     async fn region_for_key(&self, key: &Key) -> Result<RegionWithLeader> {
         let bytes: &[_] = key.into();
-        let region = if bytes.is_empty() || bytes < &[10][..] {
-            Self::region1()
-        } else if bytes >= &[10][..] && bytes < &[250, 250][..] {
-            Self::region2()
-        } else {
-            Self::region3()
-        };
-
-        Ok(region)
+        Ok(Self::lookup_region_by_key(bytes))
     }
 
     async fn region_for_id(&self, id: RegionId) -> Result<RegionWithLeader> {
-        match id {
-            1 => Ok(Self::region1()),
-            2 => Ok(Self::region2()),
-            3 => Ok(Self::region3()),
-            _ => Err(Error::RegionNotFoundInResponse { region_id: id }),
-        }
+        Self::lookup_region_by_id(id)
     }
 
     async fn all_stores(&self) -> Result<Vec<Store>> {
@@ -249,5 +267,26 @@ impl PdClient for MockPdClient {
             state: keyspacepb::KeyspaceState::Enabled as i32,
             ..Default::default()
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_mock_region_buckets_cover_region_range() {
+        let region = MockPdClient::region2();
+        let buckets = region_buckets(&region);
+
+        assert_eq!(buckets.region_id, region.id());
+        assert_eq!(
+            buckets.keys,
+            vec![
+                region.region.start_key.clone(),
+                region.region.end_key.clone()
+            ]
+        );
+        assert!(buckets.version > 0);
     }
 }

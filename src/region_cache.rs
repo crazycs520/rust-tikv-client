@@ -25,6 +25,28 @@ use crate::region::StoreId;
 use crate::Key;
 use crate::Result;
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RegionLoadResult {
+    pub(crate) region: RegionWithLeader,
+    pub(crate) buckets: Option<metapb::Buckets>,
+}
+
+impl RegionLoadResult {
+    pub(crate) fn new(region: RegionWithLeader, buckets: Option<metapb::Buckets>) -> Self {
+        Self { region, buckets }
+    }
+
+    pub(crate) fn into_region(self) -> RegionWithLeader {
+        self.region
+    }
+}
+
+impl From<RegionWithLeader> for RegionLoadResult {
+    fn from(region: RegionWithLeader) -> Self {
+        Self::new(region, None)
+    }
+}
+
 /// The cached region entry along with its expiration timestamp.
 ///
 /// `ttl_epoch_sec` is an epoch timestamp in seconds. It is updated on access (atomically) to
@@ -176,7 +198,7 @@ impl<Client> RegionCache<Client> {
     }
 }
 
-impl<C: RetryClientTrait> RegionCache<C> {
+impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
     // Retrieve cache entry by key. If there's no entry, query PD and update cache.
     pub async fn get_region_by_key(&self, key: &Key) -> Result<RegionWithLeader> {
         let key = key.clone();
@@ -330,6 +352,32 @@ impl<C: RetryClientTrait> RegionCache<C> {
         let region = self.inner_client.clone().get_region(key.into()).await?;
         self.add_region(region.clone()).await;
         Ok(region)
+    }
+
+    pub(crate) async fn read_through_region_by_key_with_buckets(
+        &self,
+        key: Key,
+    ) -> Result<RegionLoadResult> {
+        let loaded = self
+            .inner_client
+            .clone()
+            .get_region_with_buckets(key.into())
+            .await?;
+        self.add_region(loaded.region.clone()).await;
+        Ok(loaded)
+    }
+
+    pub(crate) async fn read_through_region_by_id_with_buckets(
+        &self,
+        id: RegionId,
+    ) -> Result<RegionLoadResult> {
+        let loaded = self
+            .inner_client
+            .clone()
+            .get_region_by_id_with_buckets(id)
+            .await?;
+        self.add_region(loaded.region.clone()).await;
+        Ok(loaded)
     }
 
     async fn read_through_store_by_id(&self, id: StoreId) -> Result<Store> {

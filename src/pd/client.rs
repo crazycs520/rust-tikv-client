@@ -23,6 +23,7 @@ use crate::region::RegionVerId;
 use crate::region::RegionWithLeader;
 use crate::region::StoreId;
 use crate::region_cache::RegionCache;
+use crate::region_cache::RegionLoadResult;
 use crate::store::safe_ts::SafeTsManager;
 use crate::store::safe_ts::StoreSafeTsProvider;
 use crate::store::safe_ts::StoreSafeTsRequest;
@@ -333,6 +334,22 @@ impl PdRpcClient<TikvConnect, Cluster> {
 }
 
 impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
+    fn decode_region_load(
+        mut loaded: RegionLoadResult,
+        enable_codec: bool,
+    ) -> Result<RegionLoadResult> {
+        if enable_codec {
+            codec::decode_bytes_in_place(&mut loaded.region.region.start_key, false)?;
+            codec::decode_bytes_in_place(&mut loaded.region.region.end_key, false)?;
+            if let Some(buckets) = loaded.buckets.as_mut() {
+                for key in &mut buckets.keys {
+                    codec::decode_bytes_in_place(key, false)?;
+                }
+            }
+        }
+        Ok(loaded)
+    }
+
     pub async fn new<PdFut, MakeKvC, MakePd>(
         config: Config,
         kv_connect: MakeKvC,
@@ -370,6 +387,40 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
                 config.region_cache_ttl_jitter,
             ),
         })
+    }
+
+    pub(crate) async fn load_region_by_key_with_buckets(
+        &self,
+        key: &Key,
+    ) -> Result<RegionLoadResult>
+    where
+        RetryClient<Cl>: RetryClientTrait + Send + Sync,
+    {
+        let enable_codec = self.enable_codec;
+        let key = if enable_codec {
+            key.to_encoded()
+        } else {
+            key.clone()
+        };
+        let loaded = self
+            .region_cache
+            .read_through_region_by_key_with_buckets(key)
+            .await?;
+        Self::decode_region_load(loaded, enable_codec)
+    }
+
+    pub(crate) async fn load_region_by_id_with_buckets(
+        &self,
+        id: RegionId,
+    ) -> Result<RegionLoadResult>
+    where
+        RetryClient<Cl>: RetryClientTrait + Send + Sync,
+    {
+        let loaded = self
+            .region_cache
+            .read_through_region_by_id_with_buckets(id)
+            .await?;
+        Self::decode_region_load(loaded, self.enable_codec)
     }
 
     async fn kv_client(&self, address: &str) -> Result<KvC::KvClient> {
@@ -444,6 +495,7 @@ pub mod test {
 
     use super::*;
     use crate::mock::*;
+    use crate::region_cache::RegionLoadResult;
 
     #[tokio::test]
     async fn test_kv_client_caching() {
@@ -665,5 +717,65 @@ pub mod test {
         assert_eq!(ranges2.0, vec![make_key_range(k3, k4)]);
         assert_eq!(ranges3.1.id(), 3);
         assert_eq!(ranges3.0, vec![make_key_range(k5, k6)]);
+    }
+
+    #[tokio::test]
+    async fn test_load_region_by_key_with_buckets_uses_mock_cluster() {
+        let client = pd_rpc_client().await;
+
+        let loaded = client
+            .load_region_by_key_with_buckets(&Key::from(vec![5]))
+            .await
+            .unwrap();
+
+        assert_eq!(loaded.region, MockPdClient::region1());
+        assert_eq!(
+            loaded.buckets,
+            Some(region_buckets(&MockPdClient::region1()))
+        );
+    }
+
+    #[tokio::test]
+    async fn test_load_region_by_id_with_buckets_uses_mock_cluster() {
+        let client = pd_rpc_client().await;
+
+        let loaded = client.load_region_by_id_with_buckets(2).await.unwrap();
+
+        assert_eq!(loaded.region, MockPdClient::region2());
+        assert_eq!(
+            loaded.buckets,
+            Some(region_buckets(&MockPdClient::region2()))
+        );
+    }
+
+    #[test]
+    fn test_decode_region_load_decodes_bucket_keys_when_codec_enabled() {
+        let expected_region = MockPdClient::region2();
+        let mut encoded_region = expected_region.clone();
+        encoded_region.region.start_key = Key::from(expected_region.region.start_key.clone())
+            .to_encoded()
+            .into();
+        encoded_region.region.end_key = Key::from(expected_region.region.end_key.clone())
+            .to_encoded()
+            .into();
+
+        let mut encoded_buckets = region_buckets(&expected_region);
+        encoded_buckets.keys = encoded_buckets
+            .keys
+            .into_iter()
+            .map(|key| Key::from(key).to_encoded().into())
+            .collect();
+
+        let decoded = PdRpcClient::<MockKvConnect, MockCluster>::decode_region_load(
+            RegionLoadResult::new(encoded_region, Some(encoded_buckets)),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.region, expected_region);
+        assert_eq!(
+            decoded.buckets,
+            Some(region_buckets(&MockPdClient::region2()))
+        );
     }
 }

@@ -20,19 +20,34 @@ use crate::proto::pdpb::{self};
 use crate::region::RegionId;
 use crate::region::RegionWithLeader;
 use crate::region::StoreId;
+use crate::region_cache::RegionLoadResult;
 use crate::stats::pd_stats;
 use crate::Error;
 use crate::PdRetryConfig;
 use crate::Result;
 use crate::SecurityManager;
 
+#[allow(private_interfaces)]
 #[async_trait]
 pub trait RetryClientTrait {
     // These get_* functions will try multiple times to make a request, reconnecting as necessary.
     // It does not know about encoding. Caller should take care of it.
     async fn get_region(self: Arc<Self>, key: Vec<u8>) -> Result<RegionWithLeader>;
 
+    async fn get_region_with_buckets(self: Arc<Self>, key: Vec<u8>) -> Result<RegionLoadResult> {
+        self.get_region(key).await.map(RegionLoadResult::from)
+    }
+
     async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader>;
+
+    async fn get_region_by_id_with_buckets(
+        self: Arc<Self>,
+        region_id: RegionId,
+    ) -> Result<RegionLoadResult> {
+        self.get_region_by_id(region_id)
+            .await
+            .map(RegionLoadResult::from)
+    }
 
     async fn get_store(self: Arc<Self>, id: StoreId) -> Result<metapb::Store>;
 
@@ -156,6 +171,7 @@ impl RetryClient<Cluster> {
     }
 }
 
+#[allow(private_interfaces)]
 #[async_trait]
 impl RetryClientTrait for RetryClient<Cluster> {
     // These get_* functions will try multiple times to make a request, reconnecting as necessary.
@@ -174,6 +190,25 @@ impl RetryClientTrait for RetryClient<Cluster> {
         })
     }
 
+    async fn get_region_with_buckets(self: Arc<Self>, key: Vec<u8>) -> Result<RegionLoadResult> {
+        retry_mut!(
+            self,
+            self.retry_config,
+            "get_region_with_buckets",
+            |cluster| {
+                let key = key.clone();
+                async {
+                    cluster
+                        .get_region_with_buckets(key.clone(), self.timeout)
+                        .await
+                        .and_then(|resp| {
+                            region_load_from_response(resp, || Error::RegionForKeyNotFound { key })
+                        })
+                }
+            }
+        )
+    }
+
     async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader> {
         retry_mut!(
             self,
@@ -185,6 +220,27 @@ impl RetryClientTrait for RetryClient<Cluster> {
                     .await
                     .and_then(|resp| {
                         region_from_response(resp, || Error::RegionNotFoundInResponse { region_id })
+                    })
+            }
+        )
+    }
+
+    async fn get_region_by_id_with_buckets(
+        self: Arc<Self>,
+        region_id: RegionId,
+    ) -> Result<RegionLoadResult> {
+        retry_mut!(
+            self,
+            self.retry_config,
+            "get_region_by_id_with_buckets",
+            |cluster| async {
+                cluster
+                    .get_region_by_id_with_buckets(region_id, self.timeout)
+                    .await
+                    .and_then(|resp| {
+                        region_load_from_response(resp, || Error::RegionNotFoundInResponse {
+                            region_id,
+                        })
                     })
             }
         )
@@ -253,11 +309,82 @@ impl fmt::Debug for RetryClient {
 }
 
 fn region_from_response(
-    mut resp: pdpb::GetRegionResponse,
+    resp: pdpb::GetRegionResponse,
     err: impl FnOnce() -> Error,
 ) -> Result<RegionWithLeader> {
+    region_load_from_response(resp, err).map(RegionLoadResult::into_region)
+}
+
+fn region_load_from_response(
+    mut resp: pdpb::GetRegionResponse,
+    err: impl FnOnce() -> Error,
+) -> Result<RegionLoadResult> {
     let region = resp.region.take().ok_or_else(err)?;
-    Ok(RegionWithLeader::new(region, resp.leader.take()))
+    Ok(RegionLoadResult::new(
+        RegionWithLeader::new(region, resp.leader.take()),
+        resp.buckets.take(),
+    ))
+}
+
+#[cfg(test)]
+#[allow(private_interfaces)]
+#[async_trait]
+impl RetryClientTrait for RetryClient<crate::mock::MockCluster> {
+    async fn get_region(self: Arc<Self>, key: Vec<u8>) -> Result<RegionWithLeader> {
+        Ok(crate::mock::MockPdClient::lookup_region_by_key(&key))
+    }
+
+    async fn get_region_with_buckets(self: Arc<Self>, key: Vec<u8>) -> Result<RegionLoadResult> {
+        let region = crate::mock::MockPdClient::lookup_region_by_key(&key);
+        Ok(RegionLoadResult::new(
+            region.clone(),
+            Some(crate::mock::region_buckets(&region)),
+        ))
+    }
+
+    async fn get_region_by_id(self: Arc<Self>, region_id: RegionId) -> Result<RegionWithLeader> {
+        crate::mock::MockPdClient::lookup_region_by_id(region_id)
+    }
+
+    async fn get_region_by_id_with_buckets(
+        self: Arc<Self>,
+        region_id: RegionId,
+    ) -> Result<RegionLoadResult> {
+        let region = crate::mock::MockPdClient::lookup_region_by_id(region_id)?;
+        Ok(RegionLoadResult::new(
+            region.clone(),
+            Some(crate::mock::region_buckets(&region)),
+        ))
+    }
+
+    async fn get_store(self: Arc<Self>, _id: StoreId) -> Result<metapb::Store> {
+        Err(Error::Unimplemented)
+    }
+
+    async fn get_all_stores(self: Arc<Self>) -> Result<Vec<metapb::Store>> {
+        Err(Error::Unimplemented)
+    }
+
+    async fn get_timestamp(self: Arc<Self>) -> Result<Timestamp> {
+        Ok(Timestamp::default())
+    }
+
+    async fn get_min_ts(self: Arc<Self>) -> Result<Timestamp> {
+        Ok(Timestamp::default())
+    }
+
+    async fn update_safepoint(self: Arc<Self>, _safepoint: u64) -> Result<bool> {
+        Ok(true)
+    }
+
+    async fn load_keyspace(&self, keyspace: &str) -> Result<keyspacepb::KeyspaceMeta> {
+        Ok(keyspacepb::KeyspaceMeta {
+            id: 0,
+            name: keyspace.to_owned(),
+            state: keyspacepb::KeyspaceState::Enabled as i32,
+            ..Default::default()
+        })
+    }
 }
 
 // A node-like thing that can be connected to.

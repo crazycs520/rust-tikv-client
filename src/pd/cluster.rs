@@ -57,6 +57,17 @@ impl Cluster {
         req.send(&mut self.client, timeout).await
     }
 
+    pub async fn get_region_with_buckets(
+        &mut self,
+        key: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<pdpb::GetRegionResponse> {
+        let mut req = pd_request!(self.id, pdpb::GetRegionRequest);
+        req.region_key = key;
+        req.need_buckets = true;
+        req.send(&mut self.client, timeout).await
+    }
+
     pub async fn get_region_by_id(
         &mut self,
         id: u64,
@@ -64,6 +75,17 @@ impl Cluster {
     ) -> Result<pdpb::GetRegionResponse> {
         let mut req = pd_request!(self.id, pdpb::GetRegionByIdRequest);
         req.region_id = id;
+        req.send(&mut self.client, timeout).await
+    }
+
+    pub async fn get_region_by_id_with_buckets(
+        &mut self,
+        id: u64,
+        timeout: Duration,
+    ) -> Result<pdpb::GetRegionResponse> {
+        let mut req = pd_request!(self.id, pdpb::GetRegionByIdRequest);
+        req.region_id = id;
+        req.need_buckets = true;
         req.send(&mut self.client, timeout).await
     }
 
