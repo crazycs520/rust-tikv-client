@@ -3,6 +3,8 @@
 use async_trait::async_trait;
 use derive_new::new;
 
+pub(crate) use self::keyspace::decode_bucket_keys;
+pub(crate) use self::keyspace::parse_keyspace_id;
 pub use self::keyspace::EncodeKeyspace;
 pub use self::keyspace::KeyMode;
 pub use self::keyspace::Keyspace;

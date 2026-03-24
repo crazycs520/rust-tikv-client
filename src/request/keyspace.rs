@@ -476,7 +476,6 @@ fn keyspace_end_prefix(keyspace_id: u32, key_mode: KeyMode) -> [u8; KEYSPACE_PRE
     end
 }
 
-#[cfg(test)]
 pub(crate) fn decode_bucket_keys(
     bucket_keys: impl IntoIterator<Item = Vec<u8>>,
     keyspace: Keyspace,
@@ -526,7 +525,6 @@ pub(crate) fn decode_bucket_keys(
     Ok(decoded)
 }
 
-#[cfg(test)]
 fn push_dedup_key(keys: &mut Vec<Vec<u8>>, key: Vec<u8>) {
     if keys.last().is_some_and(|prev| prev == &key) {
         return;
@@ -635,7 +633,6 @@ impl<T> TruncateKeyspace for std::result::Result<T, crate::Error> {
     }
 }
 
-#[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Error)]
 pub(crate) enum KeyspaceDecodeError {
     #[error("invalid api v2 key: too short")]
@@ -644,7 +641,6 @@ pub(crate) enum KeyspaceDecodeError {
     UnknownModePrefix { prefix: u8 },
 }
 
-#[cfg(test)]
 fn check_v2_key(encoded: &[u8]) -> Result<(), KeyspaceDecodeError> {
     if encoded.len() < KEYSPACE_PREFIX_LEN {
         return Err(KeyspaceDecodeError::TooShort);
@@ -655,7 +651,6 @@ fn check_v2_key(encoded: &[u8]) -> Result<(), KeyspaceDecodeError> {
     }
 }
 
-#[cfg(test)]
 pub(crate) fn parse_keyspace_id(encoded: &[u8]) -> Result<u32, KeyspaceDecodeError> {
     check_v2_key(encoded)?;
     Ok(u32::from_be_bytes([0, encoded[1], encoded[2], encoded[3]]))

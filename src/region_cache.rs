@@ -467,6 +467,55 @@ impl<C: RetryClientTrait + Send + Sync> RegionCache<C> {
             .and_then(|loaded| loaded.buckets)
     }
 
+    pub async fn update_region_buckets_from_mismatch(
+        &self,
+        ver_id: RegionVerId,
+        version: u64,
+        keys: Vec<Vec<u8>>,
+    ) -> bool {
+        let mut cache = self.region_cache.write().await;
+        let Some(cached) = cache.ver_id_to_region.get_mut(&ver_id) else {
+            return false;
+        };
+        let current_version = cached.buckets.as_ref().map_or(0, |buckets| buckets.version);
+        if current_version >= version {
+            return false;
+        }
+
+        cached.buckets = Some(metapb::Buckets {
+            region_id: cached.region.id(),
+            version,
+            keys,
+            ..Default::default()
+        });
+        cached
+            .ttl_epoch_sec
+            .store(self.ttl.next_ttl(now_epoch_sec()), Ordering::Relaxed);
+        true
+    }
+
+    pub async fn refresh_region_buckets_if_stale(
+        &self,
+        ver_id: RegionVerId,
+        latest_buckets_version: u64,
+    ) -> Result<bool> {
+        let region_id = {
+            let cache = self.region_cache.read().await;
+            let Some(cached) = cache.ver_id_to_region.get(&ver_id) else {
+                return Ok(false);
+            };
+            let current_version = cached.buckets.as_ref().map_or(0, |buckets| buckets.version);
+            if current_version >= latest_buckets_version {
+                return Ok(false);
+            }
+            cached.region.id()
+        };
+
+        self.read_through_region_by_id_with_buckets(region_id)
+            .await?;
+        Ok(true)
+    }
+
     async fn read_through_store_by_id(&self, id: StoreId) -> Result<Store> {
         let store = self.inner_client.clone().get_store(id).await?;
         self.store_cache.write().await.insert(id, store.clone());
@@ -1544,6 +1593,105 @@ mod test {
                 .await,
             Some(buckets)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_update_region_buckets_from_mismatch_updates_cache_without_pd_reload() -> Result<()>
+    {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new_with_ttl(
+            retry_client.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        );
+
+        let region = region(1, vec![], vec![10]);
+        retry_client
+            .regions
+            .lock()
+            .await
+            .insert(region.id(), region.clone());
+
+        cache
+            .read_through_region_by_key_with_buckets(vec![5].into())
+            .await?;
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 1);
+
+        let updated_keys = vec![vec![], vec![3], vec![10]];
+        assert!(
+            cache
+                .update_region_buckets_from_mismatch(region.ver_id(), 999, updated_keys.clone(),)
+                .await
+        );
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 1);
+        assert_eq!(
+            cache
+                .get_cached_region_buckets_by_ver_id(&region.ver_id())
+                .await,
+            Some(metapb::Buckets {
+                region_id: region.id(),
+                version: 999,
+                keys: updated_keys,
+                ..Default::default()
+            })
+        );
+        assert!(
+            !cache
+                .update_region_buckets_from_mismatch(
+                    region.ver_id(),
+                    11,
+                    vec![vec![], vec![4], vec![10]],
+                )
+                .await
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_refresh_region_buckets_if_stale_reloads_by_region_id() -> Result<()> {
+        let retry_client = Arc::new(MockRetryClient::default());
+        let cache = RegionCache::new_with_ttl(
+            retry_client.clone(),
+            Duration::from_secs(600),
+            Duration::from_secs(60),
+        );
+
+        let region = region(1, vec![], vec![10]);
+        let stale_buckets = metapb::Buckets {
+            region_id: region.id(),
+            version: 1,
+            keys: vec![vec![], vec![10]],
+            ..Default::default()
+        };
+        let fresh_buckets = region_buckets(&region);
+        retry_client
+            .regions
+            .lock()
+            .await
+            .insert(region.id(), region.clone());
+        cache
+            .add_region_load(RegionLoadResult::new(region.clone(), Some(stale_buckets)))
+            .await;
+
+        assert!(
+            cache
+                .refresh_region_buckets_if_stale(region.ver_id(), fresh_buckets.version)
+                .await?
+        );
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 1);
+        assert_eq!(
+            cache
+                .get_cached_region_buckets_by_ver_id(&region.ver_id())
+                .await,
+            Some(fresh_buckets.clone())
+        );
+        assert!(
+            !cache
+                .refresh_region_buckets_if_stale(region.ver_id(), fresh_buckets.version)
+                .await?
+        );
+        assert_eq!(retry_client.get_region_with_buckets_count.load(SeqCst), 1);
         Ok(())
     }
 

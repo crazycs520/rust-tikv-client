@@ -24,6 +24,10 @@ use crate::region::RegionWithLeader;
 use crate::region::StoreId;
 use crate::region_cache::RegionCache;
 use crate::region_cache::RegionLoadResult;
+use crate::request::decode_bucket_keys;
+use crate::request::parse_keyspace_id;
+use crate::request::KeyMode;
+use crate::request::Keyspace;
 use crate::store::safe_ts::SafeTsManager;
 use crate::store::safe_ts::StoreSafeTsProvider;
 use crate::store::safe_ts::StoreSafeTsRequest;
@@ -334,6 +338,38 @@ impl PdRpcClient<TikvConnect, Cluster> {
 }
 
 impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
+    const KEYSPACE_PREFIX_LEN: usize = 4;
+
+    fn infer_bucket_keyspace(encoded_bucket_keys: &[Vec<u8>]) -> Option<(Keyspace, KeyMode)> {
+        let mut inferred = None;
+        for encoded_key in encoded_bucket_keys {
+            let mut decoded_key = encoded_key.clone();
+            codec::decode_bytes_in_place(&mut decoded_key, false).ok()?;
+            if decoded_key.is_empty() {
+                continue;
+            }
+
+            let key_mode = match decoded_key.first().copied() {
+                Some(b'r') => KeyMode::Raw,
+                Some(b'x') => KeyMode::Txn,
+                _ => return None,
+            };
+            let keyspace_id = parse_keyspace_id(&decoded_key).ok()?;
+
+            match inferred {
+                None => inferred = Some((keyspace_id, key_mode)),
+                Some((expected_id, expected_mode))
+                    if expected_mode == key_mode
+                        && (keyspace_id == expected_id
+                            || (decoded_key.len() == Self::KEYSPACE_PREFIX_LEN
+                                && keyspace_id == expected_id.saturating_add(1))) => {}
+                Some(_) => return None,
+            }
+        }
+
+        inferred.map(|(keyspace_id, key_mode)| (Keyspace::Enable { keyspace_id }, key_mode))
+    }
+
     fn decode_region_load(
         mut loaded: RegionLoadResult,
         enable_codec: bool,
@@ -342,8 +378,13 @@ impl<KvC: KvConnect + Send + Sync + 'static, Cl> PdRpcClient<KvC, Cl> {
             codec::decode_bytes_in_place(&mut loaded.region.region.start_key, false)?;
             codec::decode_bytes_in_place(&mut loaded.region.region.end_key, false)?;
             if let Some(buckets) = loaded.buckets.as_mut() {
-                for key in &mut buckets.keys {
-                    codec::decode_bytes_in_place(key, false)?;
+                if let Some((keyspace, key_mode)) = Self::infer_bucket_keyspace(&buckets.keys) {
+                    buckets.keys =
+                        decode_bucket_keys(std::mem::take(&mut buckets.keys), keyspace, key_mode)?;
+                } else {
+                    for key in &mut buckets.keys {
+                        codec::decode_bytes_in_place(key, false)?;
+                    }
                 }
             }
         }
@@ -496,6 +537,7 @@ pub mod test {
     use super::*;
     use crate::mock::*;
     use crate::region_cache::RegionLoadResult;
+    use crate::request::{EncodeKeyspace, KeyMode, Keyspace};
 
     #[tokio::test]
     async fn test_kv_client_caching() {
@@ -776,6 +818,49 @@ pub mod test {
         assert_eq!(
             decoded.buckets,
             Some(region_buckets(&MockPdClient::region2()))
+        );
+    }
+
+    #[test]
+    fn test_decode_region_load_decodes_keyspace_bucket_keys_when_codec_enabled() {
+        let keyspace = Keyspace::Enable { keyspace_id: 42 };
+        let region_start: Vec<u8> = Key::from(Vec::<u8>::new())
+            .encode_keyspace(keyspace, KeyMode::Raw)
+            .into();
+        let region_end = vec![b'r', 0, 0, 43];
+
+        let mut expected_region = MockPdClient::region1();
+        expected_region.region.start_key = region_start.clone();
+        expected_region.region.end_key = region_end.clone();
+
+        let mut encoded_region = expected_region.clone();
+        encoded_region.region.start_key = Key::from(region_start.clone()).to_encoded().into();
+        encoded_region.region.end_key = Key::from(region_end.clone()).to_encoded().into();
+
+        let bucket_inside: Vec<u8> = Key::from(b"a".to_vec())
+            .encode_keyspace(keyspace, KeyMode::Raw)
+            .into();
+        let encoded_buckets = crate::proto::metapb::Buckets {
+            region_id: expected_region.id(),
+            version: 101,
+            keys: vec![
+                Key::from(region_start).to_encoded().into(),
+                Key::from(bucket_inside).to_encoded().into(),
+                Key::from(region_end).to_encoded().into(),
+            ],
+            ..Default::default()
+        };
+
+        let decoded = PdRpcClient::<MockKvConnect, MockCluster>::decode_region_load(
+            RegionLoadResult::new(encoded_region, Some(encoded_buckets)),
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(decoded.region, expected_region);
+        assert_eq!(
+            decoded.buckets.unwrap().keys,
+            vec![Vec::new(), b"a".to_vec(), Vec::new()]
         );
     }
 }
